@@ -1091,6 +1091,19 @@ fn render_yzpp_plugin_block(
     request: &ZellijConfigPackRenderRequest,
     render_plan: &ZellijRenderPlanData,
 ) -> Vec<String> {
+    let mut lines = vec![format!(
+        "    {YZPP_PLUGIN_ALIAS} location=\"{}\" {{",
+        request.yzpp_plugin_url
+    )];
+    lines.extend(render_yzpp_config_lines(request, render_plan));
+    lines.push("    }".to_string());
+    lines
+}
+
+fn render_yzpp_config_lines(
+    request: &ZellijConfigPackRenderRequest,
+    render_plan: &ZellijRenderPlanData,
+) -> Vec<String> {
     let yzx_cli = format!("{}/shells/posix/yzx_cli.sh", request.runtime_dir);
     let bottom_popup_program =
         generated_popup_command(&request.popup_commands, BOTTOM_POPUP_COMMAND_KEY, &yzx_cli);
@@ -1098,13 +1111,7 @@ fn render_yzpp_plugin_block(
         generated_popup_command(&request.popup_commands, TOP_POPUP_COMMAND_KEY, &yzx_cli);
     let menu_program =
         generated_popup_command(&request.popup_commands, MENU_POPUP_COMMAND_KEY, &yzx_cli);
-    let mut lines = vec![
-        format!(
-            "    {YZPP_PLUGIN_ALIAS} location=\"{}\" {{",
-            request.yzpp_plugin_url
-        ),
-        "        popups {".to_string(),
-    ];
+    let mut lines = vec!["        popups {".to_string()];
 
     append_generated_popup_spec(
         &mut lines,
@@ -1172,7 +1179,6 @@ fn render_yzpp_plugin_block(
         ),
         "            }".to_string(),
         "        }".to_string(),
-        "    }".to_string(),
     ]);
     lines
 }
@@ -1284,6 +1290,15 @@ fn build_yazelix_load_plugins_block(
             render_plan,
             "        ",
         ));
+        merged_lines.push("    }".to_string());
+    }
+    let yzpp_present = merged_lines.iter().any(|line| {
+        let trimmed = line.trim();
+        trimmed == YZPP_PLUGIN_ALIAS || trimmed.starts_with(&format!("{YZPP_PLUGIN_ALIAS} "))
+    });
+    if !yzpp_present {
+        merged_lines.push(format!("    {YZPP_PLUGIN_ALIAS} {{"));
+        merged_lines.extend(render_yzpp_config_lines(request, render_plan));
         merged_lines.push("    }".to_string());
     }
     if merged_lines.is_empty() {
@@ -1772,28 +1787,26 @@ mod tests {
         }
     }
 
-    // Regression: the pane orchestrator must be loaded as a background plugin, not only declared as a plugin alias for first-message launch.
+    // Regression: background controllers must be loaded, not only declared as plugin aliases for first-message launch.
     #[test]
-    fn background_loads_pane_orchestrator_with_session_runtime_config() {
+    fn background_loads_workspace_plugins_with_session_runtime_config() {
         let output = render_zellij_config_pack(&sample_request()).unwrap();
         let config = output.merged_config;
 
         assert!(
             config.contains(r#"    yazelix_pane_orchestrator location="file:/tmp/pane.wasm" {"#)
         );
-        assert!(config.contains(
-            r#"load_plugins {
-    yazelix_pane_orchestrator {
-        runtime_dir "/opt/yazelix"
-        screen_saver_enabled "false"
-        screen_saver_idle_seconds "300"
-        screen_saver_style "random"
-        runtime_config_generation "gen-test"
-        right_sidebar_command "/opt/yazelix/bin/agent"
-        right_sidebar_arg_1 "--right"
-    }
-}"#
-        ));
+        assert!(config.contains(r#"    yzpp location="file:/tmp/yzpp.wasm" {"#));
+        let load_plugins = &config[config.find("load_plugins {").unwrap()..];
+        assert!(load_plugins.contains("    yazelix_pane_orchestrator {\n"));
+        assert!(load_plugins.contains("        runtime_dir \"/opt/yazelix\""));
+        assert!(load_plugins.contains("    yzpp {\n        popups {"));
+        assert!(load_plugins.contains("            bottom_popup {"));
+        assert!(load_plugins.contains("                arg_2 \"lazygit\""));
+        assert!(load_plugins.contains("            top_popup {"));
+        assert!(load_plugins.contains("                arg_2 \"btop\""));
+        assert!(load_plugins.contains("            gitui {"));
+        assert!(load_plugins.contains("                arg_2 \"gitui\""));
     }
 
     // Regression: external popup commands are wrapped through the runtime CLI wrapper before yzpp sees them.
