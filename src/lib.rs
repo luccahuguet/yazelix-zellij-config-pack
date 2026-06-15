@@ -1009,7 +1009,11 @@ fn render_merged_config(request: &ZellijConfigPackRenderRequest) -> String {
         request,
         &request.render_plan,
     );
-    let load_plugins_block = build_yazelix_load_plugins_block(&extracted_blocks.load_plugin_lines);
+    let load_plugins_block = build_yazelix_load_plugins_block(
+        &extracted_blocks.load_plugin_lines,
+        request,
+        &request.render_plan,
+    );
 
     [
         "// ========================================".to_string(),
@@ -1057,43 +1061,15 @@ fn build_yazelix_plugins_block(
         .iter()
         .any(|line| line.contains(&format!("{PANE_ORCHESTRATOR_PLUGIN_ALIAS} location=")));
     if !orchestrator_present {
-        merged_lines.extend([
-            format!(
-                "    {PANE_ORCHESTRATOR_PLUGIN_ALIAS} location=\"{}\" {{",
-                request.pane_orchestrator_plugin_url
-            ),
-            format!("        runtime_dir {}", json_quote(&request.runtime_dir)),
-            format!(
-                "        screen_saver_enabled \"{}\"",
-                render_plan.screen_saver_enabled
-            ),
-            format!(
-                "        screen_saver_idle_seconds \"{}\"",
-                render_plan.screen_saver_idle_seconds
-            ),
-            format!(
-                "        screen_saver_style {}",
-                json_quote(&render_plan.screen_saver_style)
-            ),
-            format!(
-                "        runtime_config_generation {}",
-                json_quote(&request.generation_fingerprint)
-            ),
-        ]);
-        merged_lines.push(format!(
-            "        right_sidebar_command {}",
-            json_quote(expand_runtime_placeholder(
-                &render_plan.right_sidebar_command,
-                &request.runtime_dir,
-            ))
+        merged_lines.extend([format!(
+            "    {PANE_ORCHESTRATOR_PLUGIN_ALIAS} location=\"{}\" {{",
+            request.pane_orchestrator_plugin_url
+        )]);
+        merged_lines.extend(render_pane_orchestrator_config_lines(
+            request,
+            render_plan,
+            "        ",
         ));
-        for (index, arg) in render_plan.right_sidebar_args.iter().enumerate() {
-            merged_lines.push(format!(
-                "        right_sidebar_arg_{} {}",
-                index + 1,
-                json_quote(expand_runtime_placeholder(arg, &request.runtime_dir))
-            ));
-        }
         merged_lines.push("    }".to_string());
     }
 
@@ -1283,7 +1259,11 @@ fn append_generated_popup_spec(
     lines.push("            }".to_string());
 }
 
-fn build_yazelix_load_plugins_block(existing_lines: &[String]) -> String {
+fn build_yazelix_load_plugins_block(
+    existing_lines: &[String],
+    request: &ZellijConfigPackRenderRequest,
+    render_plan: &ZellijRenderPlanData,
+) -> String {
     let mut seen = BTreeSet::new();
     let mut merged_lines = Vec::new();
     for line in existing_lines {
@@ -1292,11 +1272,66 @@ fn build_yazelix_load_plugins_block(existing_lines: &[String]) -> String {
             merged_lines.push(line.clone());
         }
     }
+    let orchestrator_present = merged_lines.iter().any(|line| {
+        let trimmed = line.trim();
+        trimmed == PANE_ORCHESTRATOR_PLUGIN_ALIAS
+            || trimmed.starts_with(&format!("{PANE_ORCHESTRATOR_PLUGIN_ALIAS} "))
+    });
+    if !orchestrator_present {
+        merged_lines.push(format!("    {PANE_ORCHESTRATOR_PLUGIN_ALIAS} {{"));
+        merged_lines.extend(render_pane_orchestrator_config_lines(
+            request,
+            render_plan,
+            "        ",
+        ));
+        merged_lines.push("    }".to_string());
+    }
     if merged_lines.is_empty() {
         String::new()
     } else {
         block_with_lines("load_plugins", &merged_lines)
     }
+}
+
+fn render_pane_orchestrator_config_lines(
+    request: &ZellijConfigPackRenderRequest,
+    render_plan: &ZellijRenderPlanData,
+    indent: &str,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("{indent}runtime_dir {}", json_quote(&request.runtime_dir)),
+        format!(
+            "{indent}screen_saver_enabled \"{}\"",
+            render_plan.screen_saver_enabled
+        ),
+        format!(
+            "{indent}screen_saver_idle_seconds \"{}\"",
+            render_plan.screen_saver_idle_seconds
+        ),
+        format!(
+            "{indent}screen_saver_style {}",
+            json_quote(&render_plan.screen_saver_style)
+        ),
+        format!(
+            "{indent}runtime_config_generation {}",
+            json_quote(&request.generation_fingerprint)
+        ),
+        format!(
+            "{indent}right_sidebar_command {}",
+            json_quote(expand_runtime_placeholder(
+                &render_plan.right_sidebar_command,
+                &request.runtime_dir,
+            ))
+        ),
+    ];
+    for (index, arg) in render_plan.right_sidebar_args.iter().enumerate() {
+        lines.push(format!(
+            "{indent}right_sidebar_arg_{} {}",
+            index + 1,
+            json_quote(expand_runtime_placeholder(arg, &request.runtime_dir))
+        ));
+    }
+    lines
 }
 
 fn build_merged_keybinds_block(existing_lines: &[String], override_lines: &[String]) -> String {
@@ -1735,6 +1770,30 @@ mod tests {
         for placeholder in REQUIRED_LAYOUT_PLACEHOLDERS {
             assert!(!side.content.contains(placeholder));
         }
+    }
+
+    // Regression: the pane orchestrator must be loaded as a background plugin, not only declared as a plugin alias for first-message launch.
+    #[test]
+    fn background_loads_pane_orchestrator_with_session_runtime_config() {
+        let output = render_zellij_config_pack(&sample_request()).unwrap();
+        let config = output.merged_config;
+
+        assert!(
+            config.contains(r#"    yazelix_pane_orchestrator location="file:/tmp/pane.wasm" {"#)
+        );
+        assert!(config.contains(
+            r#"load_plugins {
+    yazelix_pane_orchestrator {
+        runtime_dir "/opt/yazelix"
+        screen_saver_enabled "false"
+        screen_saver_idle_seconds "300"
+        screen_saver_style "random"
+        runtime_config_generation "gen-test"
+        right_sidebar_command "/opt/yazelix/bin/agent"
+        right_sidebar_arg_1 "--right"
+    }
+}"#
+        ));
     }
 
     // Regression: external popup commands are wrapped through the runtime CLI wrapper before yzpp sees them.
