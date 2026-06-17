@@ -90,13 +90,13 @@
             test -f "$out/share/yazelix_zellij_config_pack/layouts/yzx_side.swap.kdl"
             test -f "$out/share/yazelix_zellij_config_pack/layouts/fragments/swap_sidebar_open.kdl"
             test -f "$out/share/yazelix_zellij_config_pack/config_metadata/zellij_layout_families.toml"
-            "$out/bin/yazelix_zellij_config_pack" --schema-version | grep -q '^1$'
+            "$out/bin/yazelix_zellij_config_pack" --schema-version | grep -q '^2$'
 
             runHook postInstallCheck
           '';
 
           passthru = {
-            rendererSchemaVersion = 1;
+            rendererSchemaVersion = 2;
             layoutsPath = "share/yazelix_zellij_config_pack/layouts";
             layoutFamiliesPath = "share/yazelix_zellij_config_pack/config_metadata/zellij_layout_families.toml";
           };
