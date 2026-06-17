@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-pub const RENDERER_SCHEMA_VERSION: u64 = 1;
+pub const RENDERER_SCHEMA_VERSION: u64 = 2;
 pub const MANAGED_SIDEBAR_LAYOUT_NAME: &str = "yzx_side";
 
 const GENERATED_LAYOUT_MARKER: &str = "GENERATED ZELLIJ LAYOUT (YAZELIX)";
@@ -883,6 +883,50 @@ pub struct CustomPopup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZellijKeybindRenderRequest {
+    pub override_template_content: String,
+    pub runtime_dir: String,
+    pub zellij_keybindings: BTreeMap<String, Vec<String>>,
+    pub zellij_native_keybindings: BTreeMap<String, Vec<String>>,
+    pub custom_popups: Vec<CustomPopup>,
+    pub integration_actions: Vec<ZellijKeybindActionSpec>,
+    pub native_actions: Vec<ZellijNativeKeybindSpec>,
+    pub pane_orchestrator_plugin_alias: String,
+    pub popup_plugin_alias: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZellijKeybindActionSpec {
+    pub local_id: String,
+    pub mode: String,
+    pub plugin_alias: String,
+    pub message_name: String,
+    #[serde(default)]
+    pub payload: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZellijNativeKeybindSpec {
+    pub local_id: String,
+    pub blocks: Vec<ZellijNativeKeybindBlockSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZellijNativeKeybindBlockSpec {
+    pub mode: String,
+    pub action_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZellijKeybindRenderOutput {
+    pub override_keybinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZellijConfigPackLayoutTemplate {
     pub relative_path: String,
     pub content: String,
@@ -911,6 +955,29 @@ pub fn render_zellij_config_pack(
         layout_files: render_config_pack_layouts(request)?,
         generation_fingerprint: request.generation_fingerprint.clone(),
     })
+}
+
+pub fn render_zellij_keybinds(request: &ZellijKeybindRenderRequest) -> ZellijKeybindRenderOutput {
+    let content = request
+        .override_template_content
+        .replace(
+            PANE_ORCHESTRATOR_PLUGIN_URL_PLACEHOLDER,
+            &request.pane_orchestrator_plugin_alias,
+        )
+        .replace(RUNTIME_DIR_PLACEHOLDER, &request.runtime_dir);
+    let assigned_keys = assigned_generated_zellij_binding_keys(request);
+    let mut override_keybinds = extract_semantic_config_blocks(&content)
+        .keybind_lines
+        .into_iter()
+        .filter(|line| !unbind_line_conflicts_with_generated_key(line, &assigned_keys))
+        .collect::<Vec<_>>();
+    override_keybinds.extend(
+        build_native_zellij_keybind_lines(request)
+            .into_iter()
+            .filter(|line| !unbind_line_conflicts_with_generated_key(line, &assigned_keys)),
+    );
+    override_keybinds.extend(build_zellij_integration_keybind_lines(request));
+    ZellijKeybindRenderOutput { override_keybinds }
 }
 
 pub fn bundled_layout_templates() -> Vec<ZellijConfigPackLayoutTemplate> {
@@ -1357,6 +1424,195 @@ fn build_merged_keybinds_block(existing_lines: &[String], override_lines: &[Stri
     } else {
         block_with_lines("keybinds", &merged)
     }
+}
+
+fn assigned_generated_zellij_binding_keys(
+    request: &ZellijKeybindRenderRequest,
+) -> BTreeSet<String> {
+    let mut assigned = request
+        .zellij_keybindings
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assigned.extend(
+        request
+            .custom_popups
+            .iter()
+            .flat_map(|popup| popup.keybindings.iter().cloned()),
+    );
+    for spec in &request.native_actions {
+        if !spec
+            .blocks
+            .iter()
+            .any(|block| !block.action_lines.is_empty())
+        {
+            continue;
+        }
+        if let Some(keys) = request.zellij_native_keybindings.get(&spec.local_id) {
+            assigned.extend(keys.iter().cloned());
+        }
+    }
+    assigned
+}
+
+fn unbind_line_conflicts_with_generated_key(line: &str, assigned_keys: &BTreeSet<String>) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("unbind ")
+        && quoted_kdl_strings(trimmed)
+            .iter()
+            .any(|key| assigned_keys.contains(key))
+}
+
+fn quoted_kdl_strings(line: &str) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '"' {
+            continue;
+        }
+        let mut value = String::new();
+        let mut escaped = false;
+        for next in chars.by_ref() {
+            if escaped {
+                value.push(next);
+                escaped = false;
+            } else if next == '\\' {
+                escaped = true;
+            } else if next == '"' {
+                break;
+            } else {
+                value.push(next);
+            }
+        }
+        strings.push(value);
+    }
+    strings
+}
+
+fn build_zellij_integration_keybind_lines(request: &ZellijKeybindRenderRequest) -> Vec<String> {
+    let mut by_mode = BTreeMap::<&str, Vec<String>>::new();
+    for spec in &request.integration_actions {
+        let Some(keys) = request.zellij_keybindings.get(&spec.local_id) else {
+            continue;
+        };
+        if keys.is_empty() {
+            continue;
+        }
+        let mode_lines = by_mode.entry(&spec.mode).or_default();
+        push_zellij_message_bind(
+            mode_lines,
+            keys,
+            &spec.plugin_alias,
+            &spec.message_name,
+            spec.payload.as_deref(),
+        );
+    }
+    for popup in &request.custom_popups {
+        if popup.keybindings.is_empty() {
+            continue;
+        }
+        let mode_lines = by_mode.entry("shared").or_default();
+        push_zellij_message_bind(
+            mode_lines,
+            &popup.keybindings,
+            &request.popup_plugin_alias,
+            "toggle",
+            Some(&popup.id),
+        );
+    }
+
+    let mut lines = Vec::new();
+    for (mode, binds) in by_mode {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!("    {mode} {{"));
+        lines.extend(binds);
+        lines.push("    }".to_string());
+    }
+    lines
+}
+
+fn build_native_zellij_keybind_lines(request: &ZellijKeybindRenderRequest) -> Vec<String> {
+    let mut blocks = Vec::<(&str, Vec<String>)>::new();
+    for spec in &request.native_actions {
+        let Some(keys) = request.zellij_native_keybindings.get(&spec.local_id) else {
+            continue;
+        };
+        if keys.is_empty() {
+            continue;
+        }
+        for block in &spec.blocks {
+            push_native_zellij_block_lines(&mut blocks, keys, block);
+        }
+    }
+
+    let mut lines = Vec::new();
+    for (mode, block_lines) in blocks {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!("    {mode} {{"));
+        lines.extend(block_lines);
+        lines.push("    }".to_string());
+    }
+    lines
+}
+
+fn push_native_zellij_block_lines<'a>(
+    blocks: &mut Vec<(&'a str, Vec<String>)>,
+    keys: &[String],
+    block: &'a ZellijNativeKeybindBlockSpec,
+) {
+    let key_list = keys.iter().map(json_quote).collect::<Vec<_>>().join(" ");
+    let block_lines = blocks
+        .iter_mut()
+        .find(|(mode, _)| *mode == block.mode)
+        .map(|(_, lines)| lines);
+    let lines = if let Some(lines) = block_lines {
+        lines
+    } else {
+        blocks.push((&block.mode, Vec::new()));
+        &mut blocks.last_mut().expect("just pushed").1
+    };
+    if block.action_lines.is_empty() {
+        lines.push(format!("        unbind {key_list}"));
+    } else if block.action_lines.iter().any(|line| line.contains('\n')) {
+        lines.push(format!("        bind {key_list} {{"));
+        for action_line in &block.action_lines {
+            for line in action_line.lines() {
+                lines.push(format!("            {line}"));
+            }
+        }
+        lines.push("        }".to_string());
+    } else {
+        lines.push(format!(
+            "        bind {key_list} {{ {}; }}",
+            block.action_lines.join("; ")
+        ));
+    }
+}
+
+fn push_zellij_message_bind(
+    lines: &mut Vec<String>,
+    keys: &[String],
+    plugin_alias: &str,
+    message_name: &str,
+    payload: Option<&str>,
+) {
+    let key_list = keys.iter().map(json_quote).collect::<Vec<_>>().join(" ");
+    lines.push(format!("        bind {key_list} {{"));
+    lines.push(format!(
+        "            MessagePlugin {} {{",
+        json_quote(plugin_alias)
+    ));
+    lines.push(format!("                name {}", json_quote(message_name)));
+    if let Some(payload) = payload {
+        lines.push(format!("                payload {}", json_quote(payload)));
+    }
+    lines.push("            }".to_string());
+    lines.push("        }".to_string());
 }
 
 fn build_yazelix_ui_block(existing_ui_lines: &[String], rounded_value: &str) -> String {
@@ -1861,6 +2117,126 @@ mod tests {
             shell_label: "nu".into(),
             terminal_label: "wezterm".into(),
         }
+    }
+
+    fn sample_keybind_render_request() -> ZellijKeybindRenderRequest {
+        ZellijKeybindRenderRequest {
+            override_template_content: r#"
+keybinds {
+    shared {
+        unbind "Alt p"
+        unbind "Ctrl s"
+        unbind "Alt \"Q\""
+    }
+}
+"#
+            .to_string(),
+            runtime_dir: "/opt/yazelix".to_string(),
+            zellij_keybindings: BTreeMap::from([
+                ("menu".to_string(), vec!["Alt p".to_string()]),
+                (
+                    "open_workspace_terminal".to_string(),
+                    vec!["Alt Shift T".to_string()],
+                ),
+            ]),
+            zellij_native_keybindings: BTreeMap::from([
+                ("scroll_mode_unbind".to_string(), vec!["Ctrl s".to_string()]),
+                ("scroll_mode".to_string(), vec!["Ctrl s".to_string()]),
+                ("multiline_mode".to_string(), vec!["Ctrl Alt m".to_string()]),
+            ]),
+            custom_popups: vec![CustomPopup {
+                id: "gitui".to_string(),
+                command: vec!["gitui".to_string()],
+                keybindings: vec!["Alt Shift G".to_string()],
+                keep_alive: false,
+            }],
+            integration_actions: vec![
+                ZellijKeybindActionSpec {
+                    local_id: "menu".to_string(),
+                    mode: "shared".to_string(),
+                    plugin_alias: "yzpp".to_string(),
+                    message_name: "toggle".to_string(),
+                    payload: Some("menu".to_string()),
+                },
+                ZellijKeybindActionSpec {
+                    local_id: "open_workspace_terminal".to_string(),
+                    mode: "shared".to_string(),
+                    plugin_alias: "yazelix_pane_orchestrator".to_string(),
+                    message_name: "open_workspace_terminal".to_string(),
+                    payload: None,
+                },
+            ],
+            native_actions: vec![
+                ZellijNativeKeybindSpec {
+                    local_id: "scroll_mode_unbind".to_string(),
+                    blocks: vec![ZellijNativeKeybindBlockSpec {
+                        mode: "shared".to_string(),
+                        action_lines: Vec::new(),
+                    }],
+                },
+                ZellijNativeKeybindSpec {
+                    local_id: "scroll_mode".to_string(),
+                    blocks: vec![
+                        ZellijNativeKeybindBlockSpec {
+                            mode: "shared".to_string(),
+                            action_lines: vec!["SwitchToMode \"Scroll\"".to_string()],
+                        },
+                        ZellijNativeKeybindBlockSpec {
+                            mode: "scroll".to_string(),
+                            action_lines: vec!["SwitchToMode \"Normal\"".to_string()],
+                        },
+                    ],
+                },
+                ZellijNativeKeybindSpec {
+                    local_id: "multiline_mode".to_string(),
+                    blocks: vec![ZellijNativeKeybindBlockSpec {
+                        mode: "shared".to_string(),
+                        action_lines: vec!["SwitchToMode \"Pane\"\nTogglePaneFrames".to_string()],
+                    }],
+                },
+            ],
+            pane_orchestrator_plugin_alias: "yazelix_pane_orchestrator".to_string(),
+            popup_plugin_alias: "yzpp".to_string(),
+        }
+    }
+
+    // Regression: generated semantic/native keybinds own conflicting unbind cleanup in the child renderer.
+    #[test]
+    fn keybind_renderer_filters_generated_unbind_conflicts() {
+        let output = render_zellij_keybinds(&sample_keybind_render_request());
+        let rendered = output.override_keybinds.join("\n");
+
+        assert!(!rendered.contains(r#"unbind "Alt p""#));
+        assert!(!rendered.contains(r#"unbind "Ctrl s""#));
+        assert!(rendered.contains(r#"unbind "Alt \"Q\"""#));
+        assert!(rendered.contains(r#"bind "Alt p" {"#));
+        assert!(rendered.contains(r#"payload "menu""#));
+        assert!(rendered.contains(r#"bind "Ctrl s" { SwitchToMode "Scroll"; }"#));
+        assert!(rendered.contains(r#"bind "Ctrl s" { SwitchToMode "Normal"; }"#));
+    }
+
+    // Defends: main passes explicit action specs, while child renders the MessagePlugin KDL.
+    #[test]
+    fn keybind_renderer_routes_actions_and_custom_popups_to_declared_plugins() {
+        let output = render_zellij_keybinds(&sample_keybind_render_request());
+        let rendered = output.override_keybinds.join("\n");
+
+        assert!(rendered.contains(r#"MessagePlugin "yzpp" {"#));
+        assert!(rendered.contains(r#"payload "menu""#));
+        assert!(rendered.contains(r#"payload "gitui""#));
+        assert!(rendered.contains(r#"MessagePlugin "yazelix_pane_orchestrator" {"#));
+        assert!(rendered.contains(r#"name "open_workspace_terminal""#));
+    }
+
+    // Defends: child-owned native rendering preserves multi-line Zellij action blocks.
+    #[test]
+    fn keybind_renderer_preserves_multiline_native_action_blocks() {
+        let output = render_zellij_keybinds(&sample_keybind_render_request());
+        let rendered = output.override_keybinds.join("\n");
+
+        assert!(rendered.contains(r#"bind "Ctrl Alt m" {"#));
+        assert!(rendered.contains("            SwitchToMode \"Pane\""));
+        assert!(rendered.contains("            TogglePaneFrames"));
     }
 
     // Defends: layout placeholder percents stay aligned with the generated layout templates.
